@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+   <meta charset="utf-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1">
+   <title>Markdown Viewer</title>
+
+   <style>
+      :root {
+         --fg: #222;
+         --bg: #fff;
+         --muted: #666;
+         --code-bg: #f6f8fa;
+         --link: #1e88e5;
+         --mark: #ffeb3b;
+      }
+
+      html, body {
+         height: 100%;
+      }
+
+
+      body {
+         margin: 0;
+         padding: 24px;
+         color: var(--fg);
+         background: var(--bg);
+         font: 15px/1.6 -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      }
+
+      #fullscreen {
+         height: 100vh;
+         width: 100vw;
+         display: flex;
+         justify-content: center; /* horizontal center */
+         align-items: center; /* vertical center */
+         position: fixed; /* prevents movement during resize */
+         top: 0;
+         left: 0;
+         background: #fafafa;
+         font-size: 2rem;
+      }
+
+      h1, h2, h3, h4 {
+         line-height: 1.25;
+         margin: 1.6em 0 .6em;
+      }
+
+      p, ul, ol, pre, table, blockquote {
+         margin: .9em 0;
+      }
+
+      pre {
+         background: var(--code-bg);
+         padding: 12px;
+         border-radius: 6px;
+         overflow: auto;
+      }
+
+      code {
+         background: var(--code-bg);
+         padding: .15em .35em;
+         border-radius: 4px;
+      }
+
+      a {
+         color: var(--link);
+         text-decoration: none;
+      }
+
+         a:hover {
+            text-decoration: underline;
+         }
+
+      blockquote {
+         margin: .9em 0;
+         padding: .01em 1em;
+         color: var(--muted);
+         border-left: 4px solid #ddd;
+      }
+
+      img {
+         max-width: 100%;
+         height: auto;
+      }
+
+      mark.persist {
+         background: var(--mark);
+         padding: 0;
+      }
+
+         mark.persist.current {
+            outline: 2px solid orange;
+         }
+
+      .ink-overlay {
+         position: fixed;
+         inset: 0;
+         pointer-events: none;
+         z-index: 2147483647;
+      }
+
+         .ink-overlay canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            touch-action: none;
+            pointer-events: auto;
+            cursor: crosshair;
+         }
+   </style>
+</head>
+
+<body>
+   <div id="doc" contenteditable="true"><!--MARKDIG_HTML--></div>
+
+   <script>
+      // Prevent ALL edits, but keep caret, selection, navigation, copy.
+      const root = document.getElementById('doc');
+
+      // 1) Block DOM mutations from keyboard/IME/paste/etc.
+      root.addEventListener('beforeinput', (e) => {
+         // Allow 'format*' if you ever want selection formatting; here we block everything that changes text.
+         const t = e.inputType || '';
+         if (t.startsWith('insert') || t.startsWith('delete') || t === 'paste' || t === 'historyUndo' || t === 'historyRedo') {
+            e.preventDefault();
+         }
+      });
+
+      // 2) Block drops
+      root.addEventListener('drop', (e) => e.preventDefault());
+
+      // 3) Optional: block context menu editing actions but allow copy
+      root.addEventListener('cut', (e) => e.preventDefault());
+      // allow copy
+      // root.addEventListener('copy', (e) => {}); 
+
+      // 4) Keep focus behavior nice
+      document.addEventListener('click', (e) => {
+         // If you click anywhere in the body, ensure the editable gets focus for caret visibility.
+         if (!root.contains(document.activeElement)) root.focus();
+      });
+
+      /************** LOGGING **************/
+      window.__log = function (...args) {
+         try {
+            console.log("[INK]", ...args);
+            if (window.chrome?.webview?.postMessage) {
+               window.chrome.webview.postMessage({ log: args });
+            }
+         } catch (e) {
+            console.error("Logger error", e);
+         }
+      };
+
+      /************** HIGHLIGHT SELECTION **************/
+      (function () {
+         const ensureStyle = () => {
+            if (document.getElementById("persist-style")) return;
+            const st = document.createElement("style");
+            st.id = "persist-style";
+            st.textContent = `
+         mark.persist { background: var(--mark); padding:0; }
+         mark.persist.current { outline:2px solid orange; }
+       `;
+            document.head.appendChild(st);
+         };
+
+         window.highlightSelection = (doScroll = true) => {
+            ensureStyle();
+            const sel = window.getSelection?.();
+            if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return false;
+            const range = sel.getRangeAt(0);
+            const frag = range.extractContents();
+            const wrap = document.createElement("mark");
+            wrap.className = "persist current";
+            wrap.appendChild(frag);
+            range.insertNode(wrap);
+            document.querySelectorAll("mark.persist.current").forEach(m => {
+               if (m !== wrap) m.classList.remove("current");
+            });
+            if (doScroll) wrap.scrollIntoView({ behavior: "smooth", block: "center" });
+            sel.removeAllRanges();
+            __log("highlight");
+            return true;
+         };
+
+         window.clearHighlights = () => {
+            document.querySelectorAll("mark.persist").forEach(m => {
+               const p = m.parentNode;
+               while (m.firstChild) p.insertBefore(m.firstChild, m);
+               p.removeChild(m);
+               p.normalize();
+            });
+            __log("clear highlights");
+         };
+      })();
+
+      /************** INK OVERLAY **************/
+      (function () {
+         if (window.ink) return;
+
+         const overlay = document.createElement("div");
+         overlay.className = "ink-overlay";
+         overlay.style.display = "none";
+         const canvas = document.createElement("canvas");
+         overlay.appendChild(canvas);
+         document.body.appendChild(overlay);
+
+         const ctx = canvas.getContext("2d");
+         let strokes = [];
+         let drawing = false, active = null;
+
+         const settings = { color: "#ff0000", width: 3, alpha: 1, mode: "draw" };
+
+         function resize() {
+            const dpr = window.devicePixelRatio || 1;
+            const w = overlay.clientWidth, h = overlay.clientHeight;
+            canvas.width = Math.max(1, Math.floor(w * dpr));
+            canvas.height = Math.max(1, Math.floor(h * dpr));
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            render();
+         }
+
+         function toDoc(e) {
+            const z = (window.chrome?.webview?.zoomFactor || 1);
+            return { x: (e.clientX + scrollX) / z, y: (e.clientY + scrollY) / z, p: e.pressure > 0 ? e.pressure : 1 };
+         }
+
+         function lockDocWidth() {
+            const doc = document.getElementById('doc');
+            if (!doc) return;
+            if (lockedDocWidth == null) {
+               // use current rendered width (after CSS)
+               lockedDocWidth = doc.getBoundingClientRect().width | 0;
+               doc.style.width = lockedDocWidth + 'px';
+               doc.style.marginLeft = 'auto';
+               doc.style.marginRight = 'auto';
+               __log("layout locked", { width: lockedDocWidth });
+            }
+         }
+
+         function render() {
+            __log("render", {
+               strokes: strokes.length,
+               drawing,
+               time: performance.now()
+            });
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const z = (window.chrome?.webview?.zoomFactor || 1);
+            const ox = -scrollX, oy = -scrollY;
+
+            for (const s of strokes) {
+               if (!s.pts.length) continue;
+
+               ctx.save();
+               if (s.mode === "erase") {
+                  ctx.globalCompositeOperation = "destination-out";
+                  ctx.strokeStyle = "rgba(0,0,0,1)";
+                  ctx.lineWidth = s.width;
+               } else {
+                  ctx.globalCompositeOperation = "source-over";
+                  ctx.strokeStyle = s.color;
+                  ctx.globalAlpha = (s.mode === "highlight") ? 0.35 : s.alpha;
+                  ctx.lineWidth = s.width;
+               }
+               ctx.lineCap = "round";
+               ctx.lineJoin = "round";
+
+               ctx.beginPath();
+               const p0 = s.pts[0];
+               ctx.moveTo((p0.x + ox) * z, (p0.y + oy) * z);
+
+               for (let i = 1; i < s.pts.length; i++) {
+                  const p = s.pts[i];
+                  ctx.lineTo((p.x + ox) * z, (p.y + oy) * z);
+               }
+
+               ctx.stroke();
+               ctx.restore();
+            }
+         }
+
+         function down(e) {
+            __log("DOWN", e.button);
+            if (e.button !== 0) return;
+            e.preventDefault();
+            drawing = true;
+
+            const p = toDoc(e);
+            __log("DOWN", p);
+
+            const w = (settings.mode === "highlight") ? Math.max(8, settings.width * 4) : settings.width;
+
+            active = {
+               pts: [p],
+               color: settings.color,
+               width: w * (p.p || 1),
+               alpha: settings.alpha,
+               mode: settings.mode
+            };
+
+            strokes.push(active);
+            canvas.setPointerCapture(e.pointerId);
+            render();
+         }
+
+         function move(e) {
+            if (!drawing || !active) return;
+            e.preventDefault();
+            const p = toDoc(e);
+            active.pts.push(p);
+            __log("MOVE", p);
+            render();
+         }
+
+         function up(e) {
+            if (!drawing) return;
+            e.preventDefault();
+            drawing = false;
+            __log("UP");
+            active = null;
+            canvas.releasePointerCapture(e.pointerId);
+            render();
+         }
+
+         canvas.addEventListener("pointerdown", down, { passive: false });
+         canvas.addEventListener("pointermove", move, { passive: false });
+         canvas.addEventListener("pointerup", up, { passive: false });
+         canvas.addEventListener("pointercancel", up, { passive: false });
+
+         addEventListener("scroll", render, { passive: true });
+         addEventListener("resize", resize, { passive: true });
+         resize();
+
+         window.ink = {
+            enable() { overlay.style.display = ""; __log("ink enabled"); resize(); },
+            disable() { overlay.style.display = "none"; __log("ink disabled"); },
+            setColor(c) { settings.color = c; __log("color", c); },
+            setWidth(px) { settings.width = Math.max(1, +px || 1); __log("width", px); },
+            setAlpha(a) { settings.alpha = Math.max(0, Math.min(1, +a || 1)); __log("alpha", a); },
+            setMode(m) { settings.mode = (m === "erase" || m === "highlight") ? m : "draw"; __log("mode", settings.mode); },
+            clear() { strokes = []; __log("clear strokes"); render(); },
+            exportPng() { __log("export PNG"); return canvas.toDataURL("image/png"); },
+            exportStrokes() { __log("export strokes"); return JSON.stringify(strokes); },
+            importStrokes(json) { __log("import strokes"); try { strokes = JSON.parse(json) || []; render(); } catch (e) { __log("import error", e); } },
+            setZoomFactor(z) { __log("zoom", z); window.chrome = window.chrome || {}; window.chrome.webview = window.chrome.webview || {}; window.chrome.webview.zoomFactor = +z || 1; render(); }
+         };
+      })();
+
+      /************** LOAD MARKDOWN HTML **************/
+      window.setDocumentHtml = function (html) {
+         document.getElementById("doc").innerHTML = html || "";
+         window.scrollTo(0, 0);
+         __log("doc loaded");
+      };
+   </script>
+</body>
+</html>
