@@ -18,6 +18,6 @@
          <Button Content="Export Ink" Click="ExportInkJson" Margin="0,0,8,0"/>
       </StackPanel>
 
-      <wv2:WebView2 x:Name="Web" Grid.Row="1"/>
+      <wv2:WebView2 x:Name="Web" Grid.Row="1" KeyDown="Web_KeyDown" WebMessageReceived="Web_WebMessageReceived"/>
    </Grid>
 </Window>

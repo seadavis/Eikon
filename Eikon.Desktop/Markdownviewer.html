@@ -19,13 +19,16 @@
          height: 100%;
       }
 
-
       body {
          margin: 0;
          padding: 24px;
          color: var(--fg);
          background: var(--bg);
          font: 15px/1.6 -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      }
+
+      #doc:focus {
+         outline: none;
       }
 
       #fullscreen {
@@ -120,10 +123,28 @@
 
       // 1) Block DOM mutations from keyboard/IME/paste/etc.
       root.addEventListener('beforeinput', (e) => {
-         // Allow 'format*' if you ever want selection formatting; here we block everything that changes text.
-         const t = e.inputType || '';
-         if (t.startsWith('insert') || t.startsWith('delete') || t === 'paste' || t === 'historyUndo' || t === 'historyRedo') {
+         const t = e.inputType || "";
+         __log("Input Type: " + t);
+         if (t.startsWith("insert") || t.startsWith("delete") || t === "paste") {
             e.preventDefault();
+
+            // type text
+            if (t === "insertText" && e.data) {
+               window.typewriter.queueOp({ type: "insert", text: e.data });
+            }
+            // newline
+            else if (t === "insertParagraph") {
+               window.typewriter.queueOp({ type: "insert", text: "<br />" });
+            }
+            // backspace
+            else if (t === "deleteContentBackward") {
+               window.typewriter.queueOp({ type: "delete", count: 1 });
+            }
+            // paste text
+            else if (t === "insertFromPaste") {
+               const txt = (e.dataTransfer && e.dataTransfer.getData("text")) || "";
+               if (txt) window.typewriter.queueOp({ type: "insert", text: txt });
+            }
          }
       });
 
@@ -133,11 +154,9 @@
       // 3) Optional: block context menu editing actions but allow copy
       root.addEventListener('cut', (e) => e.preventDefault());
       // allow copy
-      // root.addEventListener('copy', (e) => {}); 
 
       // 4) Keep focus behavior nice
       document.addEventListener('click', (e) => {
-         // If you click anywhere in the body, ensure the editable gets focus for caret visibility.
          if (!root.contains(document.activeElement)) root.focus();
       });
 
@@ -160,9 +179,9 @@
             const st = document.createElement("style");
             st.id = "persist-style";
             st.textContent = `
-         mark.persist { background: var(--mark); padding:0; }
-         mark.persist.current { outline:2px solid orange; }
-       `;
+            mark.persist { background: var(--mark); padding:0; }
+            mark.persist.current { outline:2px solid orange; }
+          `;
             document.head.appendChild(st);
          };
 
@@ -231,7 +250,6 @@
             const doc = document.getElementById('doc');
             if (!doc) return;
             if (lockedDocWidth == null) {
-               // use current rendered width (after CSS)
                lockedDocWidth = doc.getBoundingClientRect().width | 0;
                doc.style.width = lockedDocWidth + 'px';
                doc.style.marginLeft = 'auto';
@@ -326,6 +344,18 @@
             render();
          }
 
+         // Post small, batched messages (≤1/frame) — left as-is
+         const pending = [];
+         let raf = 0;
+         function queueOp(op) {
+            pending.push(op);
+            if (!raf) raf = requestAnimationFrame(() => {
+               raf = 0;
+               const ops = pending.splice(0, pending.length);
+               window.chrome?.webview?.postMessage({ kind: 'ops', ops: ops, caret: window.ReadonlyCaret.getCaretIndex() });
+            });
+         }
+
          canvas.addEventListener("pointerdown", down, { passive: false });
          canvas.addEventListener("pointermove", move, { passive: false });
          canvas.addEventListener("pointerup", up, { passive: false });
@@ -334,6 +364,10 @@
          addEventListener("scroll", render, { passive: true });
          addEventListener("resize", resize, { passive: true });
          resize();
+
+         window.typewriter = {
+            queueOp
+         };
 
          window.ink = {
             enable() { overlay.style.display = ""; __log("ink enabled"); resize(); },
@@ -356,6 +390,107 @@
          window.scrollTo(0, 0);
          __log("doc loaded");
       };
+
+      /************** CARET HELPERS (added) **************/
+      (function () {
+         // Compute flattened caret index within #doc
+         function getCaretIndex() {
+            const root = document.getElementById("doc"); // contenteditable
+            const sel = window.getSelection?.();
+            if (!root || !sel || !sel.rangeCount) return 0;
+
+            const range = sel.getRangeAt(0);
+            // Walk text nodes and sum lengths until we reach the caret container
+            const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            let idx = 0, node;
+            while ((node = tw.nextNode())) {
+               if (node === range.startContainer) {
+                  const caret = idx + range.startOffset;
+                  __log("Caret:", caret);
+                  return caret;
+               }
+               idx += node.nodeValue.length;
+            }
+            __log("Caret (end):", idx);
+            return idx; // fallback to end
+         }
+
+         function placeCaretAtEnd(el) {
+            el.focus();
+
+            const sel = window.getSelection();
+            if (!sel) return;
+
+            // Find the last text node inside the element
+            function getLastTextNode(node) {
+               if (node.nodeType === Node.TEXT_NODE) {
+                  return node;
+               }
+               for (let i = node.childNodes.length - 1; i >= 0; i--) {
+                  const child = node.childNodes[i];
+                  const textNode = getLastTextNode(child);
+                  if (textNode) return textNode;
+               }
+               return null;
+            }
+
+            const textNode = getLastTextNode(el);
+
+            const range = document.createRange();
+            if (textNode) {
+              
+               // Put caret at end of last text node (preserves spaces!)
+               range.setStart(textNode, textNode.nodeValue.length);
+            } else {
+               // Element has no text nodes, place caret at end of element
+               range.selectNodeContents(el);
+               range.collapse(false);
+            }
+
+            range.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(range);
+         }
+
+         // Place caret at flattened index within #doc
+         function setCaretIndex(globalIndex) {
+            const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            let idx = 0, n;
+            while (n = tw.nextNode()) {
+               const len = n.nodeValue.length;
+               if (globalIndex <= idx + len) {
+                  const local = Math.max(0, Math.min(len, globalIndex - idx));
+                  const rg = document.createRange();
+                  rg.setStart(n, local);
+                  rg.collapse(true);
+                  const sel = getSelection();
+                  sel.removeAllRanges();
+                  sel.addRange(rg);
+                  return true;
+               }
+               idx += len;
+            }
+            // fallback to end
+            const rg = document.createRange();
+            rg.selectNodeContents(root);
+            rg.collapse(false);
+            const sel = getSelection();
+            sel.removeAllRanges();
+            sel.addRange(rg);
+            return true;
+         }
+
+         // Public API (minimal)
+         window.ReadonlyCaret = {
+            getCaretIndex,
+            setCaretIndex,
+            focus: () => root?.focus(),
+            setHtmlAndRestoreCaret(html, index) {
+               root.innerHTML = html || "";
+               placeCaretAtEnd(document.getElementById("doc"));
+            }
+         };
+      })();
    </script>
 </body>
 </html>
